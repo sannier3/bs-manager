@@ -141,11 +141,14 @@ jobs:
             - name: Verify archive
               run: |
                   set -euo pipefail
-
-                  tar -tzf BSManager-SteamFrame-linux-arm64.tar.gz \
-                      | grep -q '^bs-manager/bs-manager$'
-
+            
+                  tar -tzf BSManager-SteamFrame-linux-arm64.tar.gz > archive-contents.txt
+            
+                  grep -qx 'bs-manager/bs-manager' archive-contents.txt
+            
                   sha256sum --check SHA256SUMS
+            
+                  rm -f archive-contents.txt
 
             - name: Publish GitHub release
               env:
