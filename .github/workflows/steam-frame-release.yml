@@ -1,0 +1,178 @@
+name: Steam Frame ARM64 Release
+
+on:
+    push:
+        branches:
+            - steam-frame-build
+
+permissions:
+    contents: write
+
+concurrency:
+    group: steam-frame-release-${{ github.ref }}
+    cancel-in-progress: false
+
+jobs:
+    release:
+        if: github.repository == 'sannier3/bs-manager'
+        runs-on: ubuntu-24.04-arm
+
+        steps:
+            - name: Check out repository
+              uses: actions/checkout@v4
+              with:
+                  fetch-depth: 0
+
+            - name: Install pnpm
+              uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86
+              with:
+                  version: 10.34.4
+
+            - name: Set up bs-downloader
+              uses: ./.github/actions/setup-downloader
+
+            - name: Test downloader
+              run: cargo test --locked --manifest-path externals/bs-downloader/Cargo.toml
+
+            - name: Use Node.js
+              uses: actions/setup-node@v4
+              with:
+                  node-version-file: .nvmrc
+                  cache: pnpm
+                  cache-dependency-path: |
+                      pnpm-lock.yaml
+                      release/app/pnpm-lock.yaml
+
+            - name: Install dependencies
+              run: pnpm install --frozen-lockfile
+
+            - name: Build Linux downloader
+              run: pnpm run build-rust-scripts
+
+            - name: Build BSManager
+              run: pnpm run build
+
+            - name: Package native ARM64 application
+              run: |
+                  set -euo pipefail
+
+                  SKIP_SIGNING=true \
+                  CSC_IDENTITY_AUTO_DISCOVERY=false \
+                  pnpm exec electron-builder \
+                      --config electron-builder.config.js \
+                      --publish never \
+                      --linux dir \
+                      --arm64
+
+            - name: Validate native ARM64 build
+              run: |
+                  set -euo pipefail
+
+                  APP="release/build/linux-arm64-unpacked/bs-manager"
+
+                  test -x "$APP"
+
+                  file "$APP"
+
+                  if ! file "$APP" | grep -Eqi 'ARM aarch64|ARM64'; then
+                      echo "Expected an ARM64/aarch64 executable."
+                      exit 1
+                  fi
+
+            - name: Prepare release assets
+              id: release
+              run: |
+                  set -euo pipefail
+
+                  VERSION="$(node -p "require('./package.json').version")"
+                  SHORT_SHA="${GITHUB_SHA::7}"
+                  TAG="steam-frame-${SHORT_SHA}"
+
+                  mkdir -p dist/bs-manager
+
+                  cp -a \
+                      release/build/linux-arm64-unpacked/. \
+                      dist/bs-manager/
+
+                  tar -C dist \
+                      -czf BSManager-SteamFrame-linux-arm64.tar.gz \
+                      bs-manager
+
+                  sha256sum \
+                      BSManager-SteamFrame-linux-arm64.tar.gz \
+                      > SHA256SUMS
+
+                  export VERSION SHORT_SHA TAG
+
+                  python3 <<'PY'
+                  import json
+                  import os
+
+                  data = {
+                      "project": "BSManager",
+                      "distribution": "Steam Frame",
+                      "architecture": "aarch64",
+                      "bsmanager_version": os.environ["VERSION"],
+                      "source_repository": os.environ["GITHUB_REPOSITORY"],
+                      "source_branch": "steam-frame-build",
+                      "source_commit": os.environ["GITHUB_SHA"],
+                      "artifact": "BSManager-SteamFrame-linux-arm64.tar.gz",
+                  }
+
+                  with open("build-info.json", "w", encoding="utf-8") as f:
+                      json.dump(data, f, indent=2)
+                      f.write("\n")
+                  PY
+
+                  cat > release-notes.md <<EOF
+                  Unofficial native ARM64 build of BSManager for Valve Steam Frame.
+
+                  BSManager version: ${VERSION}
+                  Source branch: steam-frame-build
+                  Source commit: ${GITHUB_SHA}
+
+                  This build is produced from the exact source commit linked to this release.
+                  EOF
+
+                  echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+                  echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+                  echo "short_sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+
+            - name: Verify archive
+              run: |
+                  set -euo pipefail
+
+                  tar -tzf BSManager-SteamFrame-linux-arm64.tar.gz \
+                      | grep -q '^bs-manager/bs-manager$'
+
+                  sha256sum --check SHA256SUMS
+
+            - name: Publish GitHub release
+              env:
+                  GH_TOKEN: ${{ github.token }}
+                  RELEASE_TAG: ${{ steps.release.outputs.tag }}
+                  VERSION: ${{ steps.release.outputs.version }}
+                  SHORT_SHA: ${{ steps.release.outputs.short_sha }}
+              run: |
+                  set -euo pipefail
+
+                  if gh release view "$RELEASE_TAG" \
+                      --repo "$GITHUB_REPOSITORY" \
+                      >/dev/null 2>&1
+                  then
+                      gh release upload "$RELEASE_TAG" \
+                          BSManager-SteamFrame-linux-arm64.tar.gz \
+                          SHA256SUMS \
+                          build-info.json \
+                          --repo "$GITHUB_REPOSITORY" \
+                          --clobber
+                  else
+                      gh release create "$RELEASE_TAG" \
+                          BSManager-SteamFrame-linux-arm64.tar.gz \
+                          SHA256SUMS \
+                          build-info.json \
+                          --repo "$GITHUB_REPOSITORY" \
+                          --target "$GITHUB_SHA" \
+                          --title "BSManager Steam Frame ${VERSION} (${SHORT_SHA})" \
+                          --notes-file release-notes.md
+                  fi
